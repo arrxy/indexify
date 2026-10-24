@@ -66,6 +66,7 @@ enum Job {
         replace: bool,
         cancel: Arc<AtomicBool>,
     },
+    Delete(String),
     Stop,
 }
 enum Update {
@@ -73,6 +74,7 @@ enum Update {
     Searched(u64, std::result::Result<Found, String>),
     Progress(Progress),
     Built(std::result::Result<Manifest, String>),
+    Deleted(String, std::result::Result<(), String>),
 }
 
 fn worker(home: PathBuf, jobs: mpsc::Receiver<Job>, updates: mpsc::Sender<Update>) {
@@ -123,16 +125,28 @@ fn worker(home: PathBuf, jobs: mpsc::Receiver<Job>, updates: mpsc::Sender<Update
                 .map_err(|e| format!("{e:#}"));
                 let _ = updates.send(Update::Built(result));
             }
+            Job::Delete(name) => {
+                let was_active = current.as_ref().is_some_and(|c| c.manifest.name == name);
+                if was_active {
+                    current = None;
+                }
+                let result = collection::remove(&home, &name).map_err(|e| format!("{e:#}"));
+                if result.is_err() && was_active {
+                    current = Collection::open(&home, &name).ok();
+                }
+                let _ = updates.send(Update::Deleted(name, result));
+            }
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Search,
     Results,
     Preview,
     Library,
+    Info,
 }
 
 #[derive(Default)]
@@ -214,6 +228,7 @@ enum Modal {
     Import(ImportDialog),
     Help,
     Issues,
+    Delete { name: String, confirm: bool },
 }
 
 struct App {
@@ -226,9 +241,11 @@ struct App {
     hit_index: usize,
     preview_scroll: u16,
     focus: Focus,
+    info_action: usize,
     mode: QueryMode,
     request: u64,
     busy: bool,
+    deleting: Option<String>,
     progress: Option<Progress>,
     cancel: Option<Arc<AtomicBool>>,
     quitting: bool,
@@ -251,9 +268,11 @@ impl App {
             hit_index: 0,
             preview_scroll: 0,
             focus: Focus::Search,
+            info_action: 1,
             mode: QueryMode::Disjunctive,
             request: 0,
             busy: false,
+            deleting: None,
             progress: None,
             cancel: None,
             quitting: false,
@@ -323,6 +342,63 @@ impl App {
     fn hit(&self) -> Option<&Hit> {
         self.found.as_ref()?.hits.get(self.hit_index)
     }
+    fn info_collection(&self) -> Option<&Manifest> {
+        if matches!(self.focus, Focus::Library | Focus::Info) {
+            self.libraries.get(self.library_index)
+        } else {
+            self.active
+                .as_ref()
+                .or_else(|| self.libraries.get(self.library_index))
+        }
+    }
+    fn request_delete(&mut self) {
+        if let Some(collection) = self.info_collection() {
+            self.modal = Some(Modal::Delete {
+                name: collection.name.clone(),
+                confirm: false,
+            });
+        } else {
+            self.status("Choose a collection to delete.", true);
+        }
+    }
+    fn delete(&mut self, name: String, jobs: &mpsc::Sender<Job>) -> Result<()> {
+        self.modal = None;
+        self.request += 1;
+        self.busy = true;
+        self.deleting = Some(name.clone());
+        jobs.send(Job::Delete(name))?;
+        Ok(())
+    }
+    fn info_enter(&mut self, jobs: &mpsc::Sender<Job>) -> Result<()> {
+        match self.info_action {
+            0 => {
+                if let Some(collection) = self.info_collection() {
+                    self.build(
+                        collection.source.clone(),
+                        collection.name.clone(),
+                        true,
+                        jobs,
+                    )?;
+                }
+            }
+            1 => self.modal = Some(Modal::Issues),
+            _ => self.request_delete(),
+        }
+        Ok(())
+    }
+    fn toggle_mode(&mut self, jobs: &mpsc::Sender<Job>) -> Result<()> {
+        self.mode = if self.mode == QueryMode::Conjunctive {
+            QueryMode::Disjunctive
+        } else {
+            QueryMode::Conjunctive
+        };
+        if !self.query.value.is_empty() {
+            self.search(jobs)?;
+        } else {
+            self.status(format!("Search mode: {}", self.mode.label()), false);
+        }
+        Ok(())
+    }
     fn receive(&mut self, update: Update, jobs: &mpsc::Sender<Job>) -> Result<bool> {
         match update {
             Update::Progress(progress) => self.progress = Some(progress),
@@ -367,6 +443,36 @@ impl App {
                 }
             }
             Update::Searched(_, _) => {}
+            Update::Deleted(name, result) => {
+                self.busy = false;
+                self.deleting = None;
+                match result {
+                    Ok(()) => {
+                        let was_active = self.active.as_ref().is_some_and(|m| m.name == name);
+                        self.libraries = collection::list(&self.home)?;
+                        self.library_index = self
+                            .library_index
+                            .min(self.libraries.len().saturating_sub(1));
+                        if was_active {
+                            self.active = None;
+                            self.found = None;
+                            self.hit_index = 0;
+                            self.preview_scroll = 0;
+                            if let Some(next) = self.libraries.get(self.library_index) {
+                                self.open(next.name.clone(), jobs)?;
+                            } else {
+                                self.query = Input::default();
+                                self.focus = Focus::Library;
+                            }
+                        }
+                        self.status(
+                            format!("Deleted index '{name}'. Source documents remain in place."),
+                            false,
+                        );
+                    }
+                    Err(error) => self.status(error, true),
+                }
+            }
             Update::Built(result) => {
                 self.busy = false;
                 self.progress = None;
@@ -408,7 +514,7 @@ impl App {
             }
             return Ok(true);
         }
-        if self.progress.is_some() {
+        if self.progress.is_some() || self.deleting.is_some() {
             return Ok(false);
         }
         if key.code == KeyCode::F(1) {
@@ -418,20 +524,32 @@ impl App {
         if self.modal.is_some() {
             return self.modal_key(key, jobs);
         }
+        if key.code == KeyCode::F(7) {
+            self.toggle_mode(jobs)?;
+            return Ok(false);
+        }
+        let direct = match key.code {
+            KeyCode::F(2) => Some(Focus::Search),
+            KeyCode::F(3) => Some(Focus::Results),
+            KeyCode::F(4) => Some(Focus::Preview),
+            KeyCode::F(5) => Some(Focus::Library),
+            KeyCode::F(6) => Some(Focus::Info),
+            _ => None,
+        };
+        if let Some(focus) = direct {
+            self.focus = focus;
+            return Ok(false);
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('n') => self.add_dialog(),
                 KeyCode::Char('l') => self.focus = Focus::Library,
-                KeyCode::Char('m') => {
-                    self.mode = if self.mode == QueryMode::Conjunctive {
-                        QueryMode::Disjunctive
-                    } else {
-                        QueryMode::Conjunctive
-                    };
-                    if !self.query.value.is_empty() {
-                        self.search(jobs)?;
-                    }
-                }
+                KeyCode::Char('f') => self.focus = Focus::Search,
+                KeyCode::Char('e') => self.focus = Focus::Results,
+                KeyCode::Char('p') => self.focus = Focus::Preview,
+                KeyCode::Char('g') => self.focus = Focus::Info,
+                KeyCode::Char('d') => self.request_delete(),
+                KeyCode::Char('m' | 'o') => self.toggle_mode(jobs)?,
                 _ if self.focus == Focus::Search => self.query.key(key),
                 _ => {}
             }
@@ -443,12 +561,14 @@ impl App {
                     Focus::Search => Focus::Results,
                     Focus::Results => Focus::Preview,
                     Focus::Preview => Focus::Library,
-                    Focus::Library => Focus::Search,
+                    Focus::Library => Focus::Info,
+                    Focus::Info => Focus::Search,
                 }
             }
             KeyCode::BackTab => {
                 self.focus = match self.focus {
-                    Focus::Search => Focus::Library,
+                    Focus::Search => Focus::Info,
+                    Focus::Info => Focus::Library,
                     Focus::Library => Focus::Preview,
                     Focus::Preview => Focus::Results,
                     Focus::Results => Focus::Search,
@@ -466,8 +586,12 @@ impl App {
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Char('a') => self.add_dialog(),
             KeyCode::Char('w') => self.modal = Some(Modal::Issues),
+            KeyCode::Char('d') => self.request_delete(),
+            KeyCode::Delete if matches!(self.focus, Focus::Library | Focus::Info) => {
+                self.request_delete()
+            }
             KeyCode::Char('r') => {
-                if let Some(active) = &self.active {
+                if let Some(active) = self.info_collection() {
                     self.build(active.source.clone(), active.name.clone(), true, jobs)?;
                 }
             }
@@ -486,6 +610,7 @@ impl App {
                     self.focus = Focus::Search;
                 }
             }
+            KeyCode::Enter if self.focus == Focus::Info => self.info_enter(jobs)?,
             KeyCode::Enter | KeyCode::Char('o') => {
                 if let Some(hit) = self.hit() {
                     let result = collection::open_hit(hit);
@@ -501,6 +626,12 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Library => {
                 self.library_index = self.library_index.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Info => {
+                self.info_action = (self.info_action + 1) % 3
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.focus == Focus::Info => {
+                self.info_action = (self.info_action + 2) % 3
             }
             KeyCode::Down | KeyCode::Char('j') if self.focus == Focus::Preview => {
                 self.preview_scroll = self.preview_scroll.saturating_add(1)
@@ -538,6 +669,26 @@ impl App {
     fn modal_key(&mut self, key: KeyEvent, jobs: &mpsc::Sender<Job>) -> Result<bool> {
         if key.code == KeyCode::Esc {
             self.modal = None;
+            return Ok(false);
+        }
+        if let Some(Modal::Delete { name, confirm }) = self.modal.as_mut() {
+            let mut submit = None;
+            let mut cancel = false;
+            match key.code {
+                KeyCode::Tab | KeyCode::BackTab => *confirm = !*confirm,
+                KeyCode::Left => *confirm = false,
+                KeyCode::Right => *confirm = true,
+                KeyCode::Char('y') | KeyCode::Char('Y') => submit = Some(name.clone()),
+                KeyCode::Enter if *confirm => submit = Some(name.clone()),
+                KeyCode::Enter | KeyCode::Char('n') | KeyCode::Char('N') => cancel = true,
+                _ => {}
+            }
+            if cancel {
+                self.modal = None;
+            }
+            if let Some(name) = submit {
+                self.delete(name, jobs)?;
+            }
             return Ok(false);
         }
         if let Some(Modal::Import(dialog)) = self.modal.as_mut() {
@@ -772,15 +923,19 @@ fn draw(frame: &mut Frame, app: &mut App) {
     let outer = shell.inner(window);
     frame.render_widget(shell, window);
     let rows = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Min(8),
         Constraint::Length(3),
     ])
     .split(outer);
     let menu = Layout::horizontal([Constraint::Min(20), Constraint::Length(24)]).split(rows[0]);
     frame.render_widget(
-        Paragraph::new("^N Add   ^L Library   ^M Any/All   F1 Help")
-            .style(Style::default().fg(TEXT).bg(PANEL)),
+        Paragraph::new(if area.width >= 105 {
+            "^N Add   ^D Delete   F7 AND/OR   F1 Help"
+        } else {
+            "^N Add  ^D Delete  F7 AND/OR  F1 Help"
+        })
+        .style(Style::default().fg(TEXT).bg(PANEL)),
         menu[0],
     );
     frame.render_widget(
@@ -790,11 +945,38 @@ fn draw(frame: &mut Frame, app: &mut App) {
         menu[1],
     );
     if rows[0].height > 1 {
+        let navigation = [
+            (Focus::Search, "F2 Search"),
+            (Focus::Results, "F3 Results"),
+            (Focus::Preview, "F4 Preview"),
+            (Focus::Library, "F5 Library"),
+            (Focus::Info, "F6 Info"),
+        ]
+        .into_iter()
+        .map(|(focus, label)| {
+            Span::styled(
+                format!("[{label}] "),
+                Style::default()
+                    .fg(if app.focus == focus { PAPER } else { TEXT })
+                    .bg(if app.focus == focus { ACCENT } else { PANEL }),
+            )
+        })
+        .collect::<Vec<_>>();
+        frame.render_widget(
+            Paragraph::new(Line::from(navigation)),
+            Rect {
+                y: rows[0].y + 1,
+                height: 1,
+                ..rows[0]
+            },
+        );
+    }
+    if rows[0].height > 2 {
         frame.render_widget(
             Paragraph::new("─".repeat(rows[0].width as usize))
                 .style(Style::default().fg(BORDER).bg(PANEL)),
             Rect {
-                y: rows[0].y + 1,
+                y: rows[0].y + 2,
                 height: 1,
                 ..rows[0]
             },
@@ -848,7 +1030,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         draw_empty(frame, app, work[2]);
     }
-    let status = if app.busy {
+    let status = if let Some(name) = &app.deleting {
+        format!("{} Deleting index '{name}'", spinner(app.tick))
+    } else if app.busy {
         format!(
             "{}  {}",
             spinner(app.tick),
@@ -878,12 +1062,10 @@ fn draw(frame: &mut Frame, app: &mut App) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            key(" / ", "search  "),
-            key(" Tab ", "panels  "),
+            key(" Tab ", "next  "),
             key(" ↑↓ ", "select  "),
-            key(" ↵ ", "open  "),
-            key(" ^N ", "add  "),
-            key(" ^M ", "any/all  "),
+            key(" ↵ ", "action  "),
+            key(" ^D ", "delete  "),
             key(" ^Q ", "quit"),
         ]))
         .style(Style::default().fg(MUTED).bg(PANEL)),
@@ -900,7 +1082,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         draw_modal(frame, modal, app);
     }
     if area.width < 105
-        && app.focus == Focus::Library
+        && matches!(app.focus, Focus::Library | Focus::Info)
         && app.modal.is_none()
         && app.progress.is_none()
     {
@@ -918,10 +1100,11 @@ fn key(label: &'static str, caption: &'static str) -> Span<'static> {
 }
 
 fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
-    let rows = Layout::vertical([Constraint::Min(5), Constraint::Length(10)])
+    let info_height = if area.height >= 22 { 12 } else { 8 };
+    let rows = Layout::vertical([Constraint::Min(4), Constraint::Length(info_height)])
         .spacing(1)
         .split(area);
-    let block = panel(" Collections ", app.focus == Focus::Library).paper();
+    let block = panel(" F5 Collections ", app.focus == Focus::Library).paper();
     let inner = block.inner(rows[0]);
     frame.render_widget(block, rows[0]);
     if app.libraries.is_empty() {
@@ -974,49 +1157,72 @@ fn draw_library(frame: &mut Frame, app: &App, area: Rect) {
             &mut state,
         );
     }
-    let details = if let Some(active) = &app.active {
-        vec![
-            Line::styled("SNAPSHOT", Style::default().fg(ACCENT).bold()),
-            Line::raw(""),
-            Line::styled(
-                format!(
-                    "{} · {}",
-                    age(active.built_at),
-                    human_bytes(active.index_bytes)
-                ),
-                Style::default().fg(TEXT),
+    draw_info(frame, app, rows[1]);
+}
+
+fn draw_info(frame: &mut Frame, app: &App, area: Rect) {
+    let info = panel(" F6 Collection info ", app.focus == Focus::Info);
+    let inner = info.inner(area);
+    frame.render_widget(info, area);
+    let mut details = Vec::new();
+    if let Some(collection) = app.info_collection() {
+        if inner.height >= 8 {
+            details.push(Line::styled("SNAPSHOT", Style::default().fg(ACCENT).bold()));
+            details.push(Line::raw(""));
+        }
+        details.push(Line::styled(
+            format!(
+                "{} · {}",
+                age(collection.built_at),
+                human_bytes(collection.index_bytes)
             ),
-            Line::styled(
-                format!("{} import issues", active.issues.len()),
-                Style::default().fg(if active.issues.is_empty() {
-                    MUTED
-                } else {
-                    SECONDARY
-                }),
-            ),
-            Line::raw(""),
-            Line::styled("r refresh snapshot", Style::default().fg(MUTED)),
-            Line::styled("w import report", Style::default().fg(MUTED)),
+            Style::default().fg(TEXT),
+        ));
+        details.push(Line::styled(
+            format!("{} import issues", collection.issues.len()),
+            Style::default().fg(if collection.issues.is_empty() {
+                MUTED
+            } else {
+                SECONDARY
+            }),
+        ));
+        if inner.height >= 8 {
+            details.push(Line::raw(""));
+        }
+        for (index, label) in [
+            "[r] Refresh snapshot",
+            "[w] Import report",
+            "[d] Delete index",
         ]
+        .iter()
+        .enumerate()
+        {
+            let selected = app.focus == Focus::Info && app.info_action == index;
+            details.push(Line::styled(
+                *label,
+                Style::default()
+                    .fg(if selected { PAPER } else { TEXT })
+                    .bg(if selected { ACCENT } else { PANEL }),
+            ));
+        }
     } else {
-        vec![
-            Line::styled("A LITTLE LESS LOST.", Style::default().fg(ACCENT).bold()),
-            Line::raw(""),
-            Line::styled("One document or a folder.", Style::default().fg(MUTED)),
-            Line::styled("Everything stays local.", Style::default().fg(MUTED)),
-            Line::raw(""),
-            Line::styled("? keyboard shortcuts", Style::default().fg(DIM)),
-        ]
-    };
-    let info = panel(" Collection info ", false);
-    let info_inner = info.inner(rows[1]);
-    frame.render_widget(info, rows[1]);
-    frame.render_widget(Paragraph::new(details), info_inner);
+        details.push(Line::styled(
+            "No collection selected.",
+            Style::default().fg(MUTED),
+        ));
+        details.push(Line::raw(""));
+        details.push(Line::styled(
+            "Ctrl+N adds a collection.",
+            Style::default().fg(ACCENT),
+        ));
+    }
+    frame.render_widget(Paragraph::new(details), inner);
 }
 
 fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
     let label = format!(
-        " Search · {} words ",
+        " F2 Search · {} ({} words) ",
+        app.mode.label(),
         if app.mode == QueryMode::Conjunctive {
             "all"
         } else {
@@ -1054,7 +1260,7 @@ fn draw_search(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
     let found = app.found.as_ref().unwrap();
-    let title = format!(" Best matches · {} ", found.hits.len());
+    let title = format!(" F3 Best matches · {} ", found.hits.len());
     let block = panel(title, app.focus == Focus::Results).paper();
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1101,7 +1307,7 @@ fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = panel(" Passage preview ", app.focus == Focus::Preview).paper();
+    let block = panel(" F4 Passage preview ", app.focus == Focus::Preview).paper();
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(hit) = app.hit() else {
@@ -1162,7 +1368,14 @@ fn draw_preview(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_empty(frame: &mut Frame, app: &App, area: Rect) {
-    let block = panel(" Explore ", false);
+    let block = panel(
+        match app.focus {
+            Focus::Results => " F3 Best matches ",
+            Focus::Preview => " F4 Passage preview ",
+            _ => " Explore ",
+        },
+        matches!(app.focus, Focus::Results | Focus::Preview),
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let (title, subtitle, extra) = if app.busy {
@@ -1184,7 +1397,7 @@ fn draw_empty(frame: &mut Frame, app: &App, area: Rect) {
     {
         (
             "No matching passages.",
-            "Try fewer words, or Ctrl+M to match any word.",
+            "Try fewer words, or F7 to switch between AND and OR.",
             "Search matches words, not exact phrases or meanings.",
         )
     } else {
@@ -1295,10 +1508,10 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
     let area = popup(
         frame.area(),
         82,
-        if matches!(modal, Modal::Issues) {
-            24
-        } else {
-            17
+        match modal {
+            Modal::Issues => 24,
+            Modal::Help => 21,
+            _ => 17,
         },
     );
     frame.render_widget(Clear, area);
@@ -1307,12 +1520,59 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             Modal::Import(_) => " Add a collection ",
             Modal::Help => " Make yourself at home ",
             Modal::Issues => " Import report ",
+            Modal::Delete { .. } => " Delete index ",
         },
         true,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     match modal {
+        Modal::Delete { name, confirm } => {
+            let rows = Layout::vertical([
+                Constraint::Length(2),
+                Constraint::Length(3),
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Min(1),
+            ])
+            .split(inner);
+            frame.render_widget(
+                Paragraph::new(format!("Delete index '{name}'?"))
+                    .style(Style::default().fg(RED).bold())
+                    .wrap(Wrap { trim: true }),
+                rows[0],
+            );
+            frame.render_widget(Paragraph::new("This removes the saved search index, extracted text snapshots, and collection metadata.")
+                .style(Style::default().fg(TEXT)).wrap(Wrap { trim: true }), rows[1]);
+            frame.render_widget(
+                Paragraph::new("Your PDF, MD and DOCX source documents remain in place.")
+                    .style(Style::default().fg(TEXT))
+                    .wrap(Wrap { trim: true }),
+                rows[2],
+            );
+            let buttons =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .spacing(2)
+                    .split(rows[3]);
+            for (index, label) in ["[ Cancel ]", "[ Delete index ]"].iter().enumerate() {
+                let selected = if index == 0 { !confirm } else { *confirm };
+                frame.render_widget(
+                    Paragraph::new(*label).centered().style(
+                        Style::default()
+                            .fg(if selected { PAPER } else { TEXT })
+                            .bg(if selected { ACCENT } else { PANEL })
+                            .bold(),
+                    ),
+                    buttons[index],
+                );
+            }
+            frame.render_widget(
+                Paragraph::new("Tab / arrows choose · Enter select · Esc cancel")
+                    .style(Style::default().fg(MUTED))
+                    .wrap(Wrap { trim: true }),
+                rows[4],
+            );
+        }
         Modal::Import(dialog) => {
             let rows = Layout::vertical([
                 Constraint::Length(2),
@@ -1358,19 +1618,24 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                 Paragraph::new(vec![
                     Line::styled("SEARCH & EXPLORE", Style::default().fg(ACCENT).bold()),
                     Line::raw(
+                        "F2 / Ctrl+F  Search    F3 / Ctrl+E  Results    F4 / Ctrl+P  Preview",
+                    ),
+                    Line::raw("F5 / Ctrl+L  Collections       F6 / Ctrl+G  Collection info"),
+                    Line::raw(
                         "/                Focus search       Enter    Search / open original",
                     ),
                     Line::raw(
                         "Tab / Shift+Tab  Switch panels      ↑↓ / jk  Select / scroll preview",
                     ),
-                    Line::raw("Ctrl+M           Any / all words    c        Copy selected passage"),
+                    Line::raw("F7 / Ctrl+O      AND / OR matching  c        Copy selected passage"),
                     Line::raw(
                         "PageUp/PageDown  Scroll preview     Esc      Leave search / close dialog",
                     ),
                     Line::raw(""),
                     Line::styled("YOUR LIBRARY", Style::default().fg(ACCENT).bold()),
                     Line::raw("Ctrl+N / a       Add a collection   Ctrl+L   Focus collection list"),
-                    Line::raw("r                Refresh snapshot   w        View import issues"),
+                    Line::raw("r  Refresh snapshot   w  Import report   Ctrl+D / d  Delete index"),
+                    Line::raw("In Collection info: arrows select an action; Enter runs it."),
                     Line::raw(
                         "Ctrl+Q / Ctrl+C  Quit               q        Quit outside text fields",
                     ),
@@ -1393,7 +1658,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                 ),
                 Line::raw(""),
             ];
-            if let Some(active) = &app.active {
+            if let Some(active) = app.info_collection() {
                 if active.issues.is_empty() {
                     lines.push(Line::styled(
                         "All supported documents were imported successfully.",
@@ -1661,6 +1926,174 @@ mod tests {
             app.add_dialog();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             app.modal = None;
+            for focus in [Focus::Library, Focus::Info] {
+                app.focus = focus;
+                terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            }
+            app.modal = Some(Modal::Delete {
+                name: "example".into(),
+                confirm: false,
+            });
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            app.modal = None;
         }
+    }
+
+    #[test]
+    fn navigation_reaches_info_and_shortcuts_work_inside_search() {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = App::new(home.path().into()).unwrap();
+        let (jobs, _receiver) = mpsc::channel();
+        app.query = Input::new("keep this query".into());
+        for expected in [
+            Focus::Results,
+            Focus::Preview,
+            Focus::Library,
+            Focus::Info,
+            Focus::Search,
+        ] {
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &jobs)
+                .unwrap();
+            assert_eq!(app.focus, expected);
+        }
+        for expected in [
+            Focus::Info,
+            Focus::Library,
+            Focus::Preview,
+            Focus::Results,
+            Focus::Search,
+        ] {
+            app.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &jobs)
+                .unwrap();
+            assert_eq!(app.focus, expected);
+        }
+        for (number, letter, expected) in [
+            (2, 'f', Focus::Search),
+            (3, 'e', Focus::Results),
+            (4, 'p', Focus::Preview),
+            (5, 'l', Focus::Library),
+            (6, 'g', Focus::Info),
+        ] {
+            app.focus = Focus::Search;
+            app.key(KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE), &jobs)
+                .unwrap();
+            assert_eq!(app.focus, expected);
+            app.focus = Focus::Search;
+            app.key(
+                KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL),
+                &jobs,
+            )
+            .unwrap();
+            assert_eq!(app.focus, expected);
+            assert_eq!(app.query.value, "keep this query");
+        }
+    }
+
+    fn fake_manifest(name: &str) -> Manifest {
+        Manifest {
+            version: 1,
+            name: name.into(),
+            source: PathBuf::from("/tmp/example.md"),
+            built_at: 0,
+            files: 1,
+            passages: 1,
+            skipped: 0,
+            issues: vec![],
+            index_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn mode_shortcuts_toggle_and_rerun_without_editing_query() {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = App::new(home.path().into()).unwrap();
+        app.active = Some(fake_manifest("example"));
+        app.query = Input::new("graph search".into());
+        let (jobs, receiver) = mpsc::channel();
+        app.key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE), &jobs)
+            .unwrap();
+        assert_eq!(app.mode, QueryMode::Conjunctive);
+        assert!(
+            matches!(receiver.recv().unwrap(), Job::Search { query, mode: QueryMode::Conjunctive, .. } if query == "graph search")
+        );
+        app.key(
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &jobs,
+        )
+        .unwrap();
+        assert_eq!(app.mode, QueryMode::Disjunctive);
+        assert!(
+            matches!(receiver.recv().unwrap(), Job::Search { query, mode: QueryMode::Disjunctive, .. } if query == "graph search")
+        );
+        assert_eq!(app.query.value, "graph search");
+        assert_eq!(app.focus, Focus::Search);
+    }
+
+    #[test]
+    fn delete_requires_confirmation_and_targets_the_highlighted_collection() {
+        let home = tempfile::tempdir().unwrap();
+        let mut app = App::new(home.path().into()).unwrap();
+        app.libraries = vec![fake_manifest("alpha"), fake_manifest("beta")];
+        app.active = Some(app.libraries[0].clone());
+        app.library_index = 1;
+        app.focus = Focus::Info;
+        let (jobs, receiver) = mpsc::channel();
+        app.info_enter(&jobs).unwrap();
+        assert!(matches!(app.modal, Some(Modal::Issues)));
+        app.modal = None;
+        app.key(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &jobs,
+        )
+        .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::Delete { name, confirm: false }) if name == "beta")
+        );
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &jobs)
+            .unwrap();
+        assert!(app.modal.is_none());
+        assert!(receiver.try_recv().is_err());
+        app.request_delete();
+        app.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &jobs)
+            .unwrap();
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &jobs)
+            .unwrap();
+        assert!(matches!(receiver.recv().unwrap(), Job::Delete(name) if name == "beta"));
+    }
+
+    #[test]
+    fn deleting_recovers_from_other_readers_and_keeps_source_documents() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("notes.md");
+        fs::write(&source, "Cobalt passage for a deletion test.").unwrap();
+        let home = temporary.path().join("library");
+        collection::build(&home, "notes", &source, false, &mut |_| Ok(())).unwrap();
+        let mut app = App::new(home.clone()).unwrap();
+        let (jobs, receiver) = mpsc::channel();
+        let (updates, events) = mpsc::channel();
+        let background = thread::spawn(move || worker(home, receiver, updates));
+        app.open("notes".into(), &jobs).unwrap();
+        app.receive(events.recv_timeout(Duration::from_secs(3)).unwrap(), &jobs)
+            .unwrap();
+        let external = Collection::open(&app.home, "notes").unwrap();
+        app.delete("notes".into(), &jobs).unwrap();
+        app.receive(events.recv_timeout(Duration::from_secs(3)).unwrap(), &jobs)
+            .unwrap();
+        assert!(app.error);
+        assert!(app.active.is_some());
+        app.query = Input::new("cobalt".into());
+        app.search(&jobs).unwrap();
+        app.receive(events.recv_timeout(Duration::from_secs(3)).unwrap(), &jobs)
+            .unwrap();
+        assert_eq!(app.found.as_ref().unwrap().hits.len(), 1);
+        drop(external);
+        app.delete("notes".into(), &jobs).unwrap();
+        app.receive(events.recv_timeout(Duration::from_secs(3)).unwrap(), &jobs)
+            .unwrap();
+        assert!(app.libraries.is_empty());
+        assert!(app.active.is_none() && app.found.is_none());
+        assert!(source.is_file());
+        jobs.send(Job::Stop).unwrap();
+        background.join().unwrap();
     }
 }

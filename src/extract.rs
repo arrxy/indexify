@@ -143,7 +143,9 @@ fn pdf(path: &Path, emit: &mut dyn FnMut(Draft) -> Result<()>) -> Result<usize> 
         );
     }
     if count == 0 {
-        bail!("No selectable text found. Scanned PDFs need OCR before indexing");
+        bail!(
+            "No extractable text recovered. The PDF may be image-only or have an unsupported/damaged text encoding. Use OCR or a PDF with a repaired text layer before indexing"
+        );
     }
     Ok(count)
 }

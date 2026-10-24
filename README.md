@@ -65,13 +65,21 @@ indexify refresh research --no-ui
 | Key | Action |
 | --- | --- |
 | F1 | Open keyboard help from any panel, including search |
+| F2 / Ctrl+F | Jump to Search |
+| F3 / Ctrl+E | Jump to Results |
+| F4 / Ctrl+P | Jump to Preview |
+| F5 / Ctrl+L | Jump to Collections |
+| F6 / Ctrl+G | Jump to Collection info |
 | `/` | Focus search (outside text fields) |
 | Enter in search | Run query and focus results |
-| Tab / Shift+Tab | Cycle search, results, preview, collections |
+| Tab / Shift+Tab | Cycle all five panels, including Collection info |
 | Up/Down or j/k | Select result/collection, or scroll focused preview |
 | Enter on a result | Open the original document in the system viewer |
 | Enter on a collection | Load it |
-| Ctrl+M | Match any word / all words |
+| Up/Down + Enter in Collection info | Select and run Refresh, Import report, or Delete index |
+| Ctrl+D | Open Delete index confirmation from any panel |
+| d / Delete outside search | Delete the chosen index; Delete key works in Collections and Collection info |
+| F7 / Ctrl+O | Toggle OR (any word) / AND (all words); rerun the current query |
 | c | Copy the selected passage |
 | Ctrl+N or a | Add a document or directory |
 | Ctrl+L | Focus collection list |
@@ -86,6 +94,15 @@ Single-letter shortcuts apply outside text fields. On Linux, copying uses
 the system default application. Page/line/paragraph references are displayed
 in the interface; opening a specific location depends on the viewer and is
 not currently automated.
+
+Delete confirmation starts on **Cancel**. Use Tab or the left/right arrows to
+choose **Delete index**, then Enter; Esc cancels. Deletion removes the generated
+index, extracted snapshots and collection metadata. Source PDF, MD and DOCX
+documents remain in place. In Collections and Collection info, actions apply to
+the highlighted collection; in the other panels, they apply to the loaded one.
+Close any other sessions using that collection before deleting it. The app
+releases its own reader, recovers the current search session if deletion is
+blocked, and loads the next collection after a successful deletion.
 
 The layout shows a collection sidebar and side-by-side results/preview on wide
 terminals. Smaller terminals hide the sidebar; narrow terminals stack the
@@ -106,7 +123,9 @@ overlap. Short paragraphs remain separate. Word documents have no stable page
 numbers without rendering, so paragraph references are used instead.
 
 Scanned/image-only PDFs need OCR before indexing. Image-only pages in mixed
-PDFs are not searchable. PDF layout extraction is best effort; complex columns,
+PDFs are not searchable. A PDF can also render normally while its embedded
+text/font mapping is damaged or unsupported. Nonempty extracted text can still
+be garbled; such a copy needs a repaired text layer or OCR for reliable search. PDF layout extraction is best effort; complex columns,
 font encodings, and reading order can affect results. DOCX headers, footers,
 comments, embedded images, and tracked-change semantics are not interpreted.
 Its main document XML is limited to 64 MiB. Markdown is indexed as source text,
