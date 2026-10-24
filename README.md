@@ -7,32 +7,92 @@ navy title bars, white document panes, and yellow search highlights. Collections
 passage previews, and keyboard navigation stay close at hand. No account, server,
 or model is required.
 
-## Run
+## Install
 
-Install a current Rust toolchain, then from this directory:
+### Homebrew
+
+With [Homebrew](https://brew.sh) installed, run:
 
 ```sh
-cargo build --release --locked
-./target/release/indexify ./examples/documents --name demo
+brew install arrxy/tap/indexify
+indexify --version
 ```
 
-This indexes the directory and opens the terminal interface. You can also run
-`./target/release/indexify` to open the library and press **Ctrl+N** to add a
-document or directory. Paths containing spaces work in the import dialog; shell
-commands should quote them.
+Homebrew automatically adds the `arrxy/tap` tap and makes the `indexify` command
+available on your PATH. The formula builds from source and installs the required
+Rust build tools automatically.
 
-To install the command on your PATH:
+To update an existing installation:
 
 ```sh
+brew update
+brew upgrade arrxy/tap/indexify
+```
+
+### From source
+
+With a current Rust toolchain installed:
+
+```sh
+git clone https://github.com/arrxy/indexify.git
+cd indexify
 cargo install --path . --locked
-indexify ~/Documents/research --name research
-indexify ./report.pdf --name report
 ```
+
+## Quick start
+
+Replace the example paths with your own document or directory:
+
+```sh
+# Index a directory recursively and open the interface.
+indexify ~/Documents/papers --name papers
+
+# Or index one document.
+indexify ~/Documents/report.pdf --name report
+
+# Open an existing collection later.
+indexify browse papers
+```
+
+Type a few keywords and press **Enter** to search. **F7 / Ctrl+O** switches
+between OR (any word) and AND (all words). Use **F2–F6** to jump between panels,
+**Ctrl+N** to add a collection, and **Ctrl+Q** to exit. The full keyboard reference
+is below.
 
 The first positional argument is the source path. Collection names are optional
 and default to the filename or directory name. Names accept letters, numbers,
 hyphens and underscores. Existing names require an explicit refresh; an import
-never silently replaces a collection.
+never silently replaces a collection. For a path containing spaces, use quotes
+and `$HOME`:
+
+```sh
+indexify "$HOME/Documents/My Papers" --name papers
+```
+
+## Screenshots
+
+Screenshots of the actual Ratatui interface, using the bundled example notes.
+
+**Wide terminal:** collections, ranked results, source locations, and highlighted
+passage previews in the Windows 95 inspired theme.
+
+![Indexify showing ranked search results and a highlighted passage preview](docs/images/desktop.png)
+
+<details>
+<summary>Compact terminal layout</summary>
+
+The collection sidebar moves into a picker on smaller terminals. **F5** opens
+Collections, and **F6** opens Collection info.
+
+![Indexify adapting its search results and preview to a compact terminal](docs/images/compact.png)
+
+</details>
+
+To try the same example notes from a source checkout:
+
+```sh
+indexify ./examples/documents --name research
+```
 
 ## Search and manage collections
 
@@ -82,7 +142,6 @@ indexify refresh research --no-ui
 | F7 / Ctrl+O | Toggle OR (any word) / AND (all words); rerun the current query |
 | c | Copy the selected passage |
 | Ctrl+N or a | Add a document or directory |
-| Ctrl+L | Focus collection list |
 | r | Rebuild the active collection from its original path |
 | w | Show import report |
 | ? | Show help |
@@ -125,7 +184,8 @@ numbers without rendering, so paragraph references are used instead.
 Scanned/image-only PDFs need OCR before indexing. Image-only pages in mixed
 PDFs are not searchable. A PDF can also render normally while its embedded
 text/font mapping is damaged or unsupported. Nonempty extracted text can still
-be garbled; such a copy needs a repaired text layer or OCR for reliable search. PDF layout extraction is best effort; complex columns,
+be garbled; such a copy needs a repaired text layer or OCR for reliable search.
+PDF layout extraction is best effort; complex columns,
 font encodings, and reading order can affect results. DOCX headers, footers,
 comments, embedded images, and tracked-change semantics are not interpreted.
 Its main document XML is limited to 64 MiB. Markdown is indexed as source text,
