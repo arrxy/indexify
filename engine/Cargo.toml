@@ -1,0 +1,12 @@
+[package]
+name = "search-engine"
+version = "0.1.0"
+edition = "2024"
+
+# CPU-only copy of the existing passage engine, kept local so Indexify is portable.
+[features]
+default = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("gpu-sort"))'] }
+
