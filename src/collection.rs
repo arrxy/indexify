@@ -1,6 +1,6 @@
 use crate::{extract, model::*};
 use anyhow::{Context, Result, bail, ensure};
-use search_engine::{
+use indexly::{
     compression::Simple9,
     index, indexer, merger,
     retrieval::{QueryMode, SearchEngine},

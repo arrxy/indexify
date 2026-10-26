@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use indexify::{collection, model::Progress, ui};
-use search_engine::retrieval::QueryMode;
+use indexly::QueryMode;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 

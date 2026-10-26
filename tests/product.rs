@@ -2,12 +2,12 @@ use indexify::{
     collection::{self, Collection},
     extract,
 };
+use indexly::QueryMode;
 use lopdf::{
     Document, Object, Stream,
     content::{Content, Operation},
     dictionary,
 };
-use search_engine::retrieval::QueryMode;
 use std::{fs, io::Write, path::Path};
 
 fn pdf_fixture(path: &Path) {

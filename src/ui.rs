@@ -5,6 +5,10 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use indexly::{
+    QueryMode,
+    tokenizer::{SimpleTokenizer, Tokenizer},
+};
 use ratatui::{
     Frame, Terminal,
     backend::TestBackend,
@@ -13,10 +17,6 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Clear, Gauge, List, ListItem, ListState, Paragraph, Widget, Wrap},
-};
-use search_engine::{
-    retrieval::QueryMode,
-    tokenizer::{SimpleTokenizer, Tokenizer},
 };
 use std::{
     collections::HashSet,

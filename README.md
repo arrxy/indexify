@@ -216,10 +216,12 @@ or removing that collection. The interface releases its own reader before a
 refresh. Abrupt termination can leave an unpublished temporary directory, which
 can be removed while the app is closed.
 
-The existing Rust passage engine lives in `engine/`. Indexify reuses its external
-sorting, parallel construction, compressed postings, block directories, and
-exact BM25 top-ten retrieval. The dictionary, page table and passage-offset
-array are resident; full passage text stays on disk. Each query scores all
+Indexify uses the published [Indexly](https://crates.io/crates/indexly) crate
+for external sorting, parallel construction, compressed postings, block
+directories, and exact BM25 top-ten retrieval. CPU indexing is enabled without
+GPU dependencies; the engine source is maintained in the
+[Indexly repository](https://github.com/arrxy/indexly). The dictionary, page
+table and passage-offset array are resident; full passage text stays on disk. Each query scores all
 matching candidates, so very common terms can be slower. Search supports any/all
 word matching; it does not provide phrase, typo-tolerant or semantic search.
 
@@ -234,4 +236,11 @@ indexify preview research --query "inverted index" --output preview.svg
 `.cells.json` file records its terminal cells. There is no separate web mockup.
 Tests exercise real PDF/DOCX extraction, mixed directories, passage references,
 Unicode, independent snapshots, failed refreshes, locks, cancellation, terminal
-layouts, and the existing search-engine correctness suite.
+layouts, and integration with Indexly. The engine correctness suite is
+maintained and run in the [Indexly repository](https://github.com/arrxy/indexly).
+
+## License
+
+Licensed under the [MIT License](LICENSE).
+
+Copyright (c) 2026 Aritro Roy.
